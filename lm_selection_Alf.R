@@ -25,14 +25,14 @@ regress.df$ship_time <- df.clean$ship_time
 regress.df$port[regress.df$port == 'JiaoJiang'] = 'JiaoJiangSSZD'
 
 
-
+# ------------------------------------------------------------------------------------------------------------------------
 # Only look at major ports and major vsl type
 regress.df <- filter(regress.df, port %in% c('NingBoZhenHai', 'NingBoHaiZhao', 'NingBoJiangYong', 'JiaoJiangSSZD', 'NingBoHuaPu'),
                                 vsl_type %in% c('0.5W', '1.3-1.5W', '1-1.25W'))
 
-
-
-
+# ------------------------------------------------------------------------------------------------------------------------
+# For each model, do cross-validation by leaving one bidding cycle out as the testset, and comparing candidate models
+# by the average fitted R-square, average Mean Absolute Error, and Mean Absolute Percentage Error
 mape_list <- c()
 r_square_list <- c()
 mae_list <- c()
@@ -74,12 +74,45 @@ for (bid in unique(regress.df$bid_time)){
 }
 res_2 <- c(mean(r_square_list), mean(mae_list), mean(mape_list))
 
-
-comparison <- data.frame(FactorModel = res_1, QuadModel = res_2)
+comparison <- data.frame(Model_1 = res_1, Model_2 = res_2)
 rownames(comparison) <- c('Avg R Square', 'Avg Mae', 'Avg MAPE')
 comparison
+
+
   
+# ------------------------------------------------------------------------------------------------------------------------  
+# Maybe 2018 is a year with a change in policy. So leave the year 2018 out and do the same for two candidate models. 
+# Interested in the model statistics.
+
+regress.df.non2018 <- filter(regress.df, ship_year < 2018)
+
+mape_list <- c()
+r_square_list <- c()
+mae_list <- c()
+for (bid in unique(regress.df.non2018$bid_time)){
+  train.df <- filter(regress.df.non2018, bid_time != bid)
+  test.df <- filter(regress.df.non2018, bid_time == bid)  
   
+  model <- lm(cost ~ trend + ship_month + ship_month_square + vsl_type + port + total_weight, data = train.df)
+  
+  result_test_raw <- data.frame(true = test.df$cost, pred = predict(model, test.df))
+  result_test_raw$error <- result_test_raw$true - result_test_raw$pred
+  r_square <- summary(model)$r.squared
+  r_square_list <- c(r_square_list, r_square)
+  mae <- mean(abs(result_test_raw$error))
+  mae_list <-c(mae_list, mae)
+  mape <- mean(abs(result_test_raw$error) / result_test_raw$true)
+  mape_list <- c(mape_list, mape)
+}
+res_2 <- c(mean(r_square_list), mean(mae_list), mean(mape_list))
+
+comparison <- data.frame(Model_1 = res_1, Model_2 = res_2)
+rownames(comparison) <- c('Avg R Square', 'Avg Mae', 'Avg MAPE')
+comparison
+
+
+
+
   
 
 
