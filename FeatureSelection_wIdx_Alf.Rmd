@@ -26,6 +26,7 @@ library(glmnet)
 
 ## 1. 导入数据
 ```{r}
+remove(list = ls())
 load("regress_df.Rda")
 regress.df <- filter(regress.df, port %in% c('NingBoZhenHai', 'NingBoHaiZhao', 'NingBoJiangYong', 'JiaoJiangSSZD', 'NingBoHuaPu'),vsl_type %in% c('0.5W', '1.3-1.5W', '1-1.25W'))
 regress.df
@@ -66,7 +67,7 @@ mae_list_1 <- c()
 mape_list_1 <- c()
 total_cost_list_1 <- c()
 total_cost_perc_list_1 <- c()
-bid_cycles <- unique(regress.df$bid_time) 
+bid_cycles <- unique(regress.df$bid_time)[-1]
 
 for (bid in bid_cycles){
   train.df <- filter(regress.df, bid_time != bid)
@@ -261,6 +262,47 @@ ggplot(data = x, aes(x = Date)) +
 当然，我们新引入了很多变量，其结果就是有过多的变量需要我们做筛选。
 
 ### 3.4 带指数模型（Idx Model）
+```{r}
+bid_cycles <- unique(regress.df$bid_time)
+last_bid <- tail(bid_cycles[bid_cycles < "2016-5-12"], 1)
+# temp <- filter(regress.df, bid_time == last_bid)
+# mean(temp$adjusted_cost)
+length(last_bid)
+```
+
+加入变量“最近一次同类型船价”
+```{r}
+regress.df$price_diff <- regress.df$cost - regress.df$adjusted_cost
+regress.df$latest_cost <- NA
+regress.df$avg_latest_adj_cost <- NA
+bid_cycles <- unique(regress.df$bid_time)
+
+for (i in 1: nrow(regress.df)){
+  temp = filter(regress.df, bid_time < regress.df[i, "bid_time"], price_diff == regress.df[i, "price_diff"], 
+                vsl_type == regress.df[i, "vsl_type"])
+  if (nrow(temp) > 0) {
+    regress.df[i, "latest_cost"] <- tail(temp$cost, 1)
+  }
+  else{
+    temp = filter(regress.df, bid_time < regress.df[i, "bid_time"], vsl_type == regress.df[i, "vsl_type"])
+    if (nrow(temp) > 0) {
+    regress.df[i, "latest_cost"] <- tail(temp$adjusted_cost, 1) + regress.df[i, "price_diff"]
+  }
+  }
+  
+  last_bid <- tail(bid_cycles[bid_cycles < regress.df[i, "bid_time"]], 1)
+  if (length(last_bid) > 0){
+  temp2 <- filter(regress.df, bid_time == last_bid)
+  regress.df[i, "avg_latest_adj_cost"] <- mean(temp2$adjusted_cost)  
+  }
+}
+
+regress.df$ship_year_factor <- as.factor(regress.df$ship_year)
+
+```
+
+
+
 
 *** ATT： 现有指数为手工挑选， 可以在现有基础上继续尝试
 
@@ -270,20 +312,30 @@ mae_list_2 <- c()
 mape_list_2 <- c()
 total_cost_list_2 <- c()
 total_cost_perc_list_2 <- c()
-bid_cycles <- unique(regress.df$bid_time) 
+bid_cycles <- unique(regress.df$bid_time)[-1]
+
+All_result <- data.frame(true = c(), pred = c(), wgt = c(), DaysFromBid = c(), 
+                         vsl_type = c(), bid_time = c(), ship_time = c())
+regress.df$DaysFromBid <- as.numeric(regress.df$DaysFromBid)
+regress.df$DaysFromBid_sq <- regress.df$DaysFromBid^2
 
 for (bid in bid_cycles){
   train.df <- filter(regress.df, bid_time != bid)
   test.df <- filter(regress.df, bid_time == bid)  
-  
+
   # ================== Change Model Here ============================================
-  model <- lm(cost ~ trend + ship_month + ship_month_square + vsl_type + port + ship_year +
+  model <- lm(cost ~ trend + ship_month + ship_month_square + vsl_type + port + 
                 Fuel180 + 
                 N_ZhaPu_2_3_wt_month_fcst, data = train.df)
   # =================================================================================
   
   result_test_raw <- data.frame(true = test.df$cost, pred = predict(model, test.df), 
-                                wgt = test.df$total_weight)
+                                wgt = test.df$total_weight, DaysFromBid = test.df$DaysFromBid,
+                                vsl_type = test.df$vsl_type, bid_time = test.df$bid_time,
+                                ship_time = test.df$ship_time)
+  
+  All_result <- rbind(All_result, result_test_raw)
+    
   result_test_raw$error <- result_test_raw$true - result_test_raw$pred
   r_square <- summary(model)$r.squared
   r_square_list_2 <- c(r_square_list_2, r_square)
@@ -300,10 +352,11 @@ for (bid in bid_cycles){
   total_cost_list_2 <- c(total_cost_list_2, total_cost_err)
   total_cost_perc_list_2 <- c(total_cost_perc_list_2, total_cost_err_perc)
   
+  
 }
 res_2 <- c(mean(r_square_list_2), mean(mae_list_2), mean(mape_list_2), 
            mean(abs(total_cost_list_2)), mean(abs(total_cost_perc_list_2)))
-temp2 <- data.frame(bid_cycles = bid_cycles, total_cost_error2 = total_cost_list_2, 
+temp2 <- data.frame(bid_cycles = bid_cycles, total_cost_error2 = total_cost_list_2,
                     total_cost_error_perc2 = total_cost_perc_list_2)
 
 comparison <- merge(temp1, temp2, by = "bid_cycles")
@@ -332,15 +385,46 @@ grid.arrange(g.top, g.bottom, heights = c(0.5 + epsilon, 0.5 - epsilon))
 comparison2 <- data.frame(Benchmark = res_1, IdxModel = res_2)
 rownames(comparison2) <- c('Avg R Square', 'Avg Mae', 'Avg MAPE', 'TBC-AE', 'TBC-APE')
 
-```
-
-
-```{r}
 comparison2
+
+All_result$Error <- All_result$true - All_result$pred
+All_result$PercError <- (All_result$true - All_result$pred)/All_result$true
+
+ggplot(data = All_result, aes(x = DaysFromBid)) + 
+  geom_point(aes(y = Error)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 5, linetype = "dotted", color = "red") +
+  geom_hline(yintercept = -5, linetype = "dotted", color = "red") +
+  facet_wrap(~ vsl_type)
+
+ggplot(data = All_result, aes(x = DaysFromBid)) + 
+  geom_point(aes(y = PercError)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = -0.1, linetype = "dotted", color = "red") +
+  geom_hline(yintercept = -0.1, linetype = "dotted", color = "red") +
+  facet_wrap(~ bid_time)
+
+g2.top <- ggplot(data = All_result, aes(x = ship_time)) + 
+  theme_bw() +
+  geom_line(aes(y = true, color = "Actual Cost")) +
+  geom_line(aes(y = pred, color = "Predicted (from CV)")) 
+
+g2.bottom <- ggplot(data = All_result, aes(x = ship_time)) + 
+  theme_bw() +
+  geom_line(aes(y = PercError, color = "Error")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0.1, linetype = "dotted", color = "red") +
+  geom_hline(yintercept = -0.1, linetype = "dotted", color = "red")
+
+grid.arrange(g2.top, g2.bottom, heights = c(0.5 + epsilon, 0.5 - epsilon))
+  
+  
+
+
 ```
 
 
-### 3.5 带指数模型（Idx Model）+ LASSO
+### 3.5 带指数模型（Idx Model）+ LASSO正则化
 
 该模型为Idx Model基础上加上LASSO所得，来做一定的回归量选择
 
@@ -447,6 +531,52 @@ comparison3
 # 2017年开始的平均 TBC-APE， 模型为 Idx Model 
 mean(abs(total_cost_perc_list_3[6:12]))
 ```
+
+
+
+
+
+
+加入变量“最近一次同类型船价”
+
+```{r}
+test_df <- regress.df %>% select(bid_time, cost, port, vsl_type, ship_time)
+test_df$last_cost <- NA
+
+for (i in 1: nrow(test_df)){
+  temp = filter(test_df, bid_time < test_df[i, "bid_time"], port == test_df[i, "port"], 
+                vsl_type == test_df[i, "vsl_type"])
+  if (nrow(temp) > 0) {
+    test_df[i, "last_cost"] <- tail(temp$cost, 1)
+  }
+}
+
+```
+
+
+```{r}
+i = 26
+test_df[i, "bid_time"]
+test_df[i, "port"]
+test_df[i, "vsl_type"]
+temp = filter(test_df, bid_time < test_df[i, "bid_time"], port == test_df[i, "port"], 
+                vsl_type == test_df[i, "vsl_type"])
+tail(temp$cost, 1)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
