@@ -1,0 +1,639 @@
+---
+title: "信风 - 船价预测模型"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+```{r warning=FALSE, message=FALSE}
+library(RJSONIO)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(dplyr)
+library(readxl)
+library(readr)
+library(reshape)
+library(zoo)
+library(glmnet)
+```
+
+
+数据已经清理完毕，整合在了同一个dataframe里。但我们在这个时候只关心出现频次最高的港口和船只类型。由于“船只类型”为类型变量，有可能有些船只只在某一次竞标内出现，所以没法再训练集中被拟合。我们在筛选出数据中班次最多的五个港口和三种船只类型：
+- 镇海，海兆，江甬， 椒江，黄埔
+- 0.5万吨，1.3-1.5万吨，1-1.25万吨
+每次以单次竞标的班次作为测试集，其他竞标班次作为训练集，做交叉检验。
+
+## 1. 导入数据
+```{r}
+remove(list = ls())
+load("regress_df.Rda")
+regress.df <- filter(regress.df, port %in% c('NingBoZhenHai', 'NingBoHaiZhao', 'NingBoJiangYong', 'JiaoJiangSSZD', 'NingBoHuaPu'),vsl_type %in% c('0.5W', '1.3-1.5W', '1-1.25W'))
+regress.df
+```
+
+## 2. 基准模型（简单的回归模型，不含指数信息）
+
+基准模型为
+
+$$\text{Cost} \sim~ \text{Long-term Trend} + \text{Month} + \text{Month}^2 + \text{Vsl_Type} + \text{Port}$$
+其中
+
+ - Long-term Trend = 船期当月到2016年“0月”的月份数, 例如. 2016年一月对应数值为1, 2017年2月对应数值为14.\\
+
+ - Month - 月份，数值变量，1，2，3，...， 12
+
+ - Month$^2$ - 月份的平方，数值变量，用来拟合年份内U形或者倒U型的趋势
+
+ - Vsl_Type - 类别变量
+
+ - Port - 类别变量
+
+对于每个模型我们比较其一下统计量 （“平均”指的是对每个交叉检测的测试集结果取平均）
+
+- 平均 $R^2$ 
+
+- 平均 MAE 
+
+- 平均 MAPE 
+
+- 平均竞标总价误差（Total Bid Cost-Absolute Error, TBC-AE)：档次实际竞标总价（只包含五大港口和三种主要船型）和主要船型（三中）和对该次竞标预测的总价之间误差的绝对值，单位为万元。 TBC—CE不包括绑垫、跨港、逾期、理货等费用
+
+- 平均竞标总价误差（Total Bid Cost-Absolute Percentage Error, TBC-APE）: TBC-AE/总价
+
+```{r}
+r_square_list_1 <- c()
+mae_list_1 <- c()
+mape_list_1 <- c()
+total_cost_err_list_1 <- c()
+total_cost_perc_list_1 <- c()
+unit_cost_err_list_1 <- c()
+bid_cycles <- unique(regress.df$bid_time)[-1]
+
+for (bid in bid_cycles){
+  train.df <- filter(regress.df, bid_time != bid)
+  test.df <- filter(regress.df, bid_time == bid)  
+  model <- lm(cost ~ trend + ship_month + ship_month_square + vsl_type + port, data = train.df)
+  
+  result_test_raw <- data.frame(true = test.df$cost, pred = predict(model, test.df), 
+                                wgt = test.df$total_weight)
+  result_test_raw$error <- result_test_raw$true - result_test_raw$pred
+  r_square <- summary(model)$r.squared
+  r_square_list_1 <- c(r_square_list_1, r_square)
+  mae <- mean(abs(result_test_raw$error))
+  mae_list_1 <-c(mae_list_1, mae)
+  mape <- mean(abs(result_test_raw$error) / result_test_raw$true)
+  mape_list_1 <- c(mape_list_1, mape)
+  
+  actual_total_cost = sum(result_test_raw$true * result_test_raw$wgt)
+  pred_total_cost = sum(result_test_raw$pred * result_test_raw$wgt)
+  total_cost_err = (pred_total_cost - actual_total_cost)/10000
+  unit_cost_err =  total_cost_err*10000/sum(result_test_raw$wgt)
+  total_cost_err_perc = (pred_total_cost - actual_total_cost)/actual_total_cost
+  
+  total_cost_err_list_1 <- c(total_cost_err_list_1, total_cost_err)
+  total_cost_perc_list_1 <- c(total_cost_perc_list_1, total_cost_err_perc)
+  unit_cost_err_list_1 <- c(unit_cost_err_list_1, unit_cost_err)
+  
+}
+res_1 <- c(mean(r_square_list_1), mean(mae_list_1), mean(mape_list_1), 
+           mean(abs(total_cost_err_list_1)), mean(abs(total_cost_perc_list_1)), mean(abs(unit_cost_err_list_1)))
+
+temp1 <- data.frame(bid_cycles = bid_cycles, total_cost_error = total_cost_err_list_1, total_cost_error_perc = total_cost_perc_list_1,
+                    unit_cost_error = unit_cost_err_list_1)
+
+# 
+  
+g.top <- ggplot(data = temp1, aes(x = bid_cycles, y = total_cost_error)) + 
+  theme_bw() + geom_line(linetype = "dashed", color = "red") + geom_point(color = "red") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey") + 
+  labs(x = "bid cycles", title = "Benchmark Model (red dotted)", y = "TBC-AE (W RMB)")
+  
+g.mid <- ggplot(data = temp1, aes(x = bid_cycles, y = unit_cost_error)) + 
+  theme_bw() + geom_line(linetype = "dashed", color = "red") + geom_point(color = "red") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey") + 
+  labs(x = "bid cycles", title = "Benchmark Model (red dotted)", y = "PTC -AE (RMB)")
+
+g.bottom<- ggplot(data = temp1, aes(x = bid_cycles, y = abs(total_cost_error_perc))) +
+  theme_bw() + geom_line(linetype = "dashed", color = "red") + geom_point(color = "red") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey") + 
+  labs(x = "bid cycles", y = "TBC-APE")
+
+epsilon = 0.05
+mat <- matrix(c(1,2,3), nrow = 3)
+grid.arrange(g.top, g.mid, g.bottom, nrow = 3)
+```
+
+以上第一张图解释了每次竞标的总成本的absolute erroe (AE), 第二张图解释了每次竞标平均每吨成本AE，第三张图解释了每次竞标的absolute percentage erroe (APE)。 
+基准模型的平均$R^2$大概为79\%,  不过整体的预测效果还是差强人意（正值代表高估了整体价格， 负值代表低估了整体船价）。
+以下表格是各项指标的平均值。
+
+```{r}
+res_1 <- data.frame(Benchmark_Model = res_1)
+rownames(res_1) = c("R-square", "MAE", "MAPE", "TBC-AE", "TBC-APE", "PTC-AE")
+res_1
+```
+
+
+
+## 3. 包含指数信息的回归模型
+
+我们收集并清理了一下指数：
+
+- BDI (波罗的海指数，来源：李博石月月收集)   
+- CNB_Idx (中国沿海杂散货航运指数，来源：彭博客户端)
+- Fuel180 (180号船用燃油香港期货交易现货价格，来源：彭博客户端)
+- SH_GP_Price (上海钢坯价格，来源：李博石月月收集)                   
+- SH_LWG_Price (上海螺纹钢价格，来源：李博石月月收集)          
+- Shanghang_Idx (上航指数，来源：李博石月月收集)               
+- SHCB_Idx (上海航运交易所煤炭散货运输指数，来源：彭博客户端， 另外还有中国煤炭杂散货指数，同来自于彭博客户端，但是跟上海航运交易所煤炭散货运输指数相关性非常强，故先不予考虑)
+- N_ZhaPu_2_3_wt (北方-乍浦2-3万吨价格，来源：李博石月月收集。该数据提取自神海指数。由于神海指数中几子价格相关性很强，而神海指数本身为几个子价格的平均值，故只选取跟镇海最近的乍浦港)
+
+### 3.1 中国煤炭散货运输指数 vs. 上海航运交易所煤炭散货运输指数
+```{r, warning = FALSE, message=FALSE}
+CN <- read_excel("CN_Coastal_Bulk_Coal_Freight_Idx.xlsx")
+SH <- read_excel("SHSPCBCF.xlsx")
+CN <- rename(CN, c("China Coastal Bulk Coal Freight Index" = "CN_Coal_Idx"))
+CN$Date <- as.Date(CN$Date, "%Y/%m/%d")
+SH$Date <- as.Date(SH$Date, "%Y/%m/%d")
+# c(min(SH$Date), max(SH$Date)) 
+comparison = merge(x = CN, y = SH, by = "Date", all.y = TRUE)
+ggplot(data = comparison, aes(x = Date)) +            
+  geom_point(aes(y = CN_Coal_Idx, color = "CN")) +
+  geom_line(aes(y = SHSPCBCF, color = "SH")) +
+  ylab("Index Value")
+
+```
+
+
+
+### 3.2 神海指数中各航线价格相关性
+```{r, warning=FALSE, message=FALSE, results= "hide"}
+# Shenhai Idx 2016
+x <- read_excel("2016_ShenhaiIndex_Shi.xlsx")
+x <- rename(x, c("date" = "Date",
+                 "北-张家港（2-4万吨）" = "N_ZhangJiaGang_2_4wt",
+                 "北-常熟（4-5万吨）" = "N_ChangShu_4_5_wt",
+                 "北-乍浦（2-3万吨）" = "N_ZhaPu_2_3_wt",
+                 "北-上海闸港（1.6-1.8万吨）" = "N_ShanghaiZhaGang_16_18_kt",
+                 "北-广州（6-7万吨）" = "N_GuangZhou_6_7_wt",
+                 "综合指数" = "Shenhai_Idx"))
+x$Date <- as.Date(x$Date, "%Y/%m/%d")
+ShenHai_Idx_2016 <- x
+remove(x)
+
+
+# Shenhai Idx 2017
+x <- read_csv("2017_ShenhaiIndex_Shi.csv")
+x <- rename(x, c("date" = "Date",
+                 "北-张家港（2-4万吨）" = "N_ZhangJiaGang_2_4wt",
+                 "北-常熟（4-5万吨）" = "N_ChangShu_4_5_wt",
+                 "北-乍浦（2-3万吨）" = "N_ZhaPu_2_3_wt",
+                 "北-上海闸港（1.6-1.8万吨）" = "N_ShanghaiZhaGang_16_18_kt",
+                 "北-广州（6-7万吨）" = "N_GuangZhou_6_7_wt",
+                 "综合指数" = "Shenhai_Idx"))
+x$Date <- as.Date(x$Date, "%d/%m/%Y")
+ShenHai_Idx_2017 <- x 
+remove(x)
+
+
+# Shenhai Idx 2018
+x <- read_csv("2018_ShenhaiIndex_Shi.csv")
+x <- rename(x, c("日期" = "Date",
+                 "北-张家港（2-3万吨）" = "N_ZhangJiaGang_2_4wt",
+                 "北方-常熟（4-5万吨）" = "N_ChangShu_4_5_wt",
+                 "北方-乍浦（2-3万吨）" = "N_ZhaPu_2_3_wt",
+                 "北-上海闸港（1.6-1.8万吨）" = "N_ShanghaiZhaGang_16_18_kt",
+                 "北方-广州（6-7万吨）" = "N_GuangZhou_6_7_wt",
+                 "综合指数" = "Shenhai_Idx"))
+x$Date <- as.Date(x$Date, "%Y/%m/%d")
+ShenHai_Idx_2018 <- x 
+remove(x)
+
+# Concatenate all years into a single file 
+x <- rbind(ShenHai_Idx_2016, ShenHai_Idx_2017, ShenHai_Idx_2018)
+
+# Visualize all sub-price. It turns out they are pretty collinear
+x$bm <- x$N_ZhangJiaGang_2_4wt
+x$N_ChangShu_4_5_wt <- x$N_ChangShu_4_5_wt - mean(x$N_ChangShu_4_5_wt - x$bm, na.rm = TRUE)
+x$N_ChangShu_4_5_wt <- x$N_ChangShu_4_5_wt - mean(x$N_ChangShu_4_5_wt - x$bm, na.rm = TRUE)
+x$N_ZhaPu_2_3_wt <- x$N_ZhaPu_2_3_wt - mean(x$N_ZhaPu_2_3_wt - x$bm, na.rm = TRUE)
+x$N_ShanghaiZhaGang_16_18_kt <- x$N_ShanghaiZhaGang_16_18_kt - mean(x$N_ShanghaiZhaGang_16_18_kt - x$bm, na.rm = TRUE)
+x$N_GuangZhou_6_7_wt <- x$N_GuangZhou_6_7_wt - mean(x$N_GuangZhou_6_7_wt - x$bm, na.rm = TRUE)
+
+ggplot(data = x, aes(x = Date)) +
+  geom_line(aes(y = N_ZhangJiaGang_2_4wt, color = "N_ZJG(2-4wt)")) +
+  geom_line(aes(y = N_ChangShu_4_5_wt, color = "N_CS(4-5wt)")) +
+  geom_line(aes(y = N_ZhaPu_2_3_wt, color = "N_ZP(2-3wt)")) +
+  geom_line(aes(y = N_ShanghaiZhaGang_16_18_kt, color = "N_SHZG(1.6-1.8wt))")) +
+  geom_line(aes(y = N_GuangZhou_6_7_wt, color = "N_GZ(6-7wt)")) +
+  geom_line(aes(y = Shenhai_Idx, color = "Shenhai_Idx")) +
+  ylab("Price")
+```
+
+
+### 3.3 对指数的数据的处理
+
+指数数据在录入时普遍存在几个问题:
+
+  1. 并不连续，有可能是每月一更新，有可能是周末更新
+
+  2. 起始点不同
+
+  3. 指数本身反应的是当日数值，而非预测值。故在及竞标当日`bid_time`我们无法知道签船日指数情况
+
+故，对所有指数作如下处理：
+
+- 创建一个 `Date` 轴，起始日为 2016-03-15，终止日为2018-8-15，涵盖每个自然日（不分周末）
+
+- 若该日期指数值存在，取该值
+
+- 若该日期指数值不存在，取之前最近一次非空数值
+
+假设 $X(t)$ 为某指数，我们在数据库中加入如下差分变量和斜率变量
+    
+    月，半月，周差分
+    X_month_diff(t) = X(t) - X(t - 30)
+    X_2wk_diff(t) = X(t) - X(t - 14)
+    X_1wk_diff(t) = X(t) - X(t - 7)
+    
+    月，半月，周斜率
+    X_month_diff_perc(t) = (X(t) - X(t - 30)) / X(t - 30)
+    X_2wk_diff_perc(t) = (X(t) - X(t - 14)) / X(t - 14)
+    X_1wk_diff_perc(t) = (X(t) - X(t - 7)) / X(t - 7)
+
+而对于每个船期`ship_time`，变量 `DaysFromBid` 表示该船期和竞标日之间的时间差，我们再加入船期当天对指数X的预测
+    
+    月，半月，周预测
+    X_month_fcst(t) = X(bid_day) + X_month_diff(bid_day) * DaysFromBid / 30
+    X_2wk_fcst(t) = X(bid_day) + X_2wk_diff(bid_day) * DaysFromBid / 14
+    X_1wk_fcst(t) = X(bid_day) + X_1wk_diff(bid_day) * DaysFromBid / 7
+    
+注意，这里的`month_fcst`指的不是 t 之后一个月的预测，而是在 t 当日，用竞标日的指数值，利用其竞标日对应的月差分项然后做一个线性的预测。所以，所有的数据都是在竞标日当日及之前可以获得的，没有使用任何“超时空”的信息。
+
+当然，我们新引入了很多变量，其结果就是有过多的变量需要我们做筛选。
+
+### 3.4 带指数模型（Idx Model）
+```{r}
+bid_cycles <- unique(regress.df$bid_time)
+last_bid <- tail(bid_cycles[bid_cycles < "2016-5-12"], 1)
+# temp <- filter(regress.df, bid_time == last_bid)
+# mean(temp$adjusted_cost)
+length(last_bid)
+```
+
+加入变量“最近一次同类型船价”
+```{r}
+regress.df$price_diff <- regress.df$cost - regress.df$adjusted_cost
+regress.df$latest_cost <- NA
+regress.df$avg_latest_adj_cost <- NA
+bid_cycles <- unique(regress.df$bid_time)
+
+for (i in 1: nrow(regress.df)){
+  temp = filter(regress.df, bid_time < regress.df[i, "bid_time"], price_diff == regress.df[i, "price_diff"], 
+                vsl_type == regress.df[i, "vsl_type"])
+  if (nrow(temp) > 0) {
+    regress.df[i, "latest_cost"] <- tail(temp$cost, 1)
+  }
+  else{
+    temp = filter(regress.df, bid_time < regress.df[i, "bid_time"], vsl_type == regress.df[i, "vsl_type"])
+    if (nrow(temp) > 0) {
+    regress.df[i, "latest_cost"] <- tail(temp$adjusted_cost, 1) + regress.df[i, "price_diff"]
+  }
+  }
+  
+  last_bid <- tail(bid_cycles[bid_cycles < regress.df[i, "bid_time"]], 1)
+  if (length(last_bid) > 0){
+  temp2 <- filter(regress.df, bid_time == last_bid)
+  regress.df[i, "avg_latest_adj_cost"] <- mean(temp2$adjusted_cost)  
+  }
+}
+
+regress.df$ship_year_factor <- as.factor(regress.df$ship_year)
+
+```
+
+
+
+
+*** ATT： 现有指数为手工挑选， 可以在现有基础上继续尝试
+
+```{r, warning= FALSE, message=FALSE}
+r_square_list_2 <- c()
+mae_list_2 <- c()
+mape_list_2 <- c()
+total_cost_list_2 <- c()
+total_cost_perc_list_2 <- c()
+unit_cost_err_list_2 <- c()
+bid_cycles <- unique(regress.df$bid_time)[-1]
+
+All_result <- data.frame(true = c(), pred = c(), wgt = c(), DaysFromBid = c(), 
+                         vsl_type = c(), bid_time = c(), ship_time = c())
+regress.df$DaysFromBid <- as.numeric(regress.df$DaysFromBid)
+regress.df$DaysFromBid_sq <- regress.df$DaysFromBid^2
+
+for (bid in bid_cycles){
+  train.df <- filter(regress.df, bid_time != bid)
+  test.df <- filter(regress.df, bid_time == bid)  
+
+  # ================== Change Model Here ============================================
+  model <- lm(cost ~ trend + ship_month + ship_month_square + vsl_type + port + 
+                Fuel180 + 
+                N_ZhaPu_2_3_wt_month_fcst, data = train.df)
+  # =================================================================================
+  
+  result_test_raw <- data.frame(true = test.df$cost, pred = predict(model, test.df), 
+                                wgt = test.df$total_weight, DaysFromBid = test.df$DaysFromBid,
+                                vsl_type = test.df$vsl_type, bid_time = test.df$bid_time,
+                                ship_time = test.df$ship_time)
+  
+  All_result <- rbind(All_result, result_test_raw)
+    
+  result_test_raw$error <- result_test_raw$true - result_test_raw$pred
+  r_square <- summary(model)$r.squared
+  r_square_list_2 <- c(r_square_list_2, r_square)
+  mae <- mean(abs(result_test_raw$error))
+  mae_list_2 <-c(mae_list_2, mae)
+  mape <- mean(abs(result_test_raw$error) / result_test_raw$true)
+  mape_list_2 <- c(mape_list_2, mape)
+  
+  actual_total_cost = sum(result_test_raw$true * result_test_raw$wgt)
+  pred_total_cost = sum(result_test_raw$pred * result_test_raw$wgt)
+  total_cost_err = (pred_total_cost - actual_total_cost)/10000
+  unit_cost_err =  total_cost_err*10000/sum(result_test_raw$wgt)
+  total_cost_err_perc = (pred_total_cost - actual_total_cost)/actual_total_cost
+  
+  total_cost_list_2 <- c(total_cost_list_2, total_cost_err)
+  total_cost_perc_list_2 <- c(total_cost_perc_list_2, total_cost_err_perc)
+  unit_cost_err_list_2 <- c(unit_cost_err_list_2, unit_cost_err)
+  
+  
+}
+res_2 <- c(mean(r_square_list_2), mean(mae_list_2), mean(mape_list_2), 
+           mean(abs(total_cost_list_2)), mean(abs(total_cost_perc_list_2)), mean(abs(unit_cost_err_list_2)))
+temp2 <- data.frame(bid_cycles = bid_cycles, total_cost_error2 = total_cost_list_2,
+                    total_cost_error_perc2 = total_cost_perc_list_2, unit_cost_error2 = unit_cost_err_list_2)
+
+comparison <- merge(temp1, temp2, by = "bid_cycles")
+
+g.top <- ggplot(data = comparison, aes(x = bid_cycles)) +
+  theme_bw() +
+  geom_line(aes(y = total_cost_error), color = "red", linetype = "dashed") +
+  geom_point(aes(y = total_cost_error), color = "red") +
+  geom_line(aes(y = total_cost_error2), color = "blue") +
+  geom_point(aes(y = total_cost_error2), color = "blue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  labs(title = "Forecast Error in Terms of Total Bid Cost (TBC)\nBenchmark Model (red) vs Idx Model (blue)", y = "TBC-AE (W RMB)")
+
+
+g.mid <- ggplot(data = comparison, aes(x = bid_cycles)) +
+  theme_bw() +
+  geom_line(aes(y = (unit_cost_error)), color = "red", linetype = "dashed") +
+  geom_point(aes(y = (unit_cost_error)), color = "red") +
+  geom_line(aes(y = (unit_cost_error2)), color = "blue") +
+  geom_point(aes(y = (unit_cost_error2)), color = "blue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  labs(y =  "PTC -AE (RMB)")
+
+g.bottom <- ggplot(data = comparison, aes(x = bid_cycles)) +
+  theme_bw() +
+  geom_line(aes(y = abs(total_cost_error_perc)), color = "red", linetype = "dashed") +
+  geom_point(aes(y = abs(total_cost_error_perc)), color = "red") +
+  geom_line(aes(y = abs(total_cost_error_perc2)), color = "blue") +
+  geom_point(aes(y = abs(total_cost_error_perc2)), color = "blue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  labs(y = "TBC-APE")
+
+epsilon = 0.05
+grid.arrange(g.top, g.mid, g.bottom, heights = c(0.5 + epsilon, 0.5, 0.5 - epsilon))
+
+
+
+
+```
+
+```{r}
+comparison2 <- data.frame(Benchmark = res_1, IdxModel = res_2)
+rownames(comparison2) <- c('Avg R Square', 'Avg Mae', 'Avg MAPE', 'TBC-AE', 'TBC-APE', 'PTC-AE')
+
+comparison2
+
+```
+
+```{r}
+All_result$Error <- All_result$true - All_result$pred
+All_result$PercError <- (All_result$true - All_result$pred)/All_result$true
+
+ggplot(data = All_result, aes(x = DaysFromBid)) + 
+  geom_point(aes(y = Error)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 5, linetype = "dotted", color = "red") +
+  geom_hline(yintercept = -5, linetype = "dotted", color = "red") +
+  facet_wrap(~ vsl_type)
+
+
+
+```
+
+```{r}
+ggplot(data = All_result, aes(x = DaysFromBid)) + 
+  geom_point(aes(y = PercError)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = -0.1, linetype = "dotted", color = "red") +
+  geom_hline(yintercept = -0.1, linetype = "dotted", color = "red") +
+  facet_wrap(~ bid_time)
+```
+
+```{r}
+g2.top <- ggplot(data = All_result, aes(x = ship_time)) + 
+  theme_bw() +
+  geom_line(aes(y = true, color = "Actual Cost")) +
+  geom_line(aes(y = pred, color = "Predicted (from CV)")) 
+
+g2.bottom <- ggplot(data = All_result, aes(x = ship_time)) + 
+  theme_bw() +
+  geom_line(aes(y = PercError, color = "Error")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0.1, linetype = "dotted", color = "red") +
+  geom_hline(yintercept = -0.1, linetype = "dotted", color = "red")
+
+grid.arrange(g2.top, g2.bottom, heights = c(0.5 + epsilon, 0.5 - epsilon))
+```
+
+
+### 3.5 带指数模型（Idx Model）+ LASSO正则化
+
+该模型为Idx Model基础上加上LASSO所得，来做一定的回归量选择
+
+```{r}
+r_square_list_3 <- c()
+mae_list_3 <- c()
+mape_list_3 <- c()
+total_cost_list_3 <- c()
+total_cost_perc_list_3 <- c()
+unit_cost_err_list_3 <- c()
+
+
+bid_cycles <- unique(regress.df$bid_time) 
+
+# ================== Change Model Here ============================================
+predictors <- c("trend", "ship_month", "ship_month_square", "vsl_type", 
+                "port", "ship_year", "Fuel180", "N_ZhaPu_2_3_wt_month_fcst")
+
+# =================================================================================
+lasso_columms <- c("cost", "bid_time", "total_weight", predictors)
+lasso.df <- regress.df %>% select(lasso_columms)
+
+
+for (bid in bid_cycles){
+  # First, select the best lasso parameter lambda using cv
+  train.df <- filter(lasso.df, bid_time != bid)
+  x.train <- model.matrix(cost ~., train.df)[, -1]
+  x.train <- x.train[, -c(1, 2)]
+  y.train <- as.matrix(train.df$cost)
+  m.lasso <- cv.glmnet(x.train, y.train)
+  lambda_opt <- m.lasso$lambda.min
+  lasso.best <- m.lasso$glmnet.fit
+  # Getting the R-square of the training set
+  y.fit <- predict(lasso.best, s = lambda_opt, newx = x.train)
+  sst <- sum((y.train - mean(y.train))^2)
+  sse <- sum((y.train - y.fit)^2)
+  r_square <- 1 - sse/sst
+  r_square_list_3 <- c(r_square_list_3, r_square)
+  
+  # Get MAE and MAPE from test set
+  test.df <- filter(lasso.df, bid_time == bid)  
+  x.test <- model.matrix(cost ~., test.df)[, -1]
+  x.test <- x.test[, -c(1, 2)]
+  y.test <- as.matrix(test.df$cost)
+  
+  y.predict <- predict(lasso.best, s = lambda_opt, newx = x.test)
+  mae = mean(abs(y.test - y.predict))
+  mape = mean(abs((y.test - y.predict)/y.test))
+  mae_list_3 <- c(mae_list_3, mae)
+  mape_list_3 <- c(mape_list_3, mape)
+  
+  # Calculate TBCE and TBCPE
+  actual_total_cost = sum(test.df$cost * test.df$total_weight)
+  pred_total_cost = sum(y.predict * test.df$total_weight)
+  total_cost_err = (pred_total_cost - actual_total_cost)/10000
+  unit_cost_err = total_cost_err*10000/sum(test.df$total_weight)
+  total_cost_err_perc = (pred_total_cost - actual_total_cost)/actual_total_cost
+  
+  total_cost_list_3 <- c(total_cost_list_3, total_cost_err)
+  total_cost_perc_list_3 <- c(total_cost_perc_list_3, total_cost_err_perc)
+  unit_cost_err_list_3 <- c(unit_cost_err_list_3, unit_cost_err)
+}
+
+res_3 <- c(mean(r_square_list_3), mean(mae_list_3), mean(mape_list_3), 
+           mean(abs(total_cost_list_3)), mean(abs(total_cost_perc_list_3)), mean(abs(unit_cost_err_list_3)))
+temp3 <- data.frame(bid_cycles = bid_cycles, total_cost_error3 = total_cost_list_3, 
+                    total_cost_error_perc3 = total_cost_perc_list_3, unit_cost_error3 = unit_cost_err_list_3)
+
+comparison <- merge(temp1, temp2, by = "bid_cycles")
+comparison <- merge(comparison, temp3, by = "bid_cycles")
+
+g.top <- ggplot(data = comparison, aes(x = bid_cycles)) +
+  theme_bw() +
+  geom_line(aes(y = total_cost_error), color = "red", linetype = "dashed") +
+  geom_point(aes(y = total_cost_error), color = "red") +
+  geom_line(aes(y = total_cost_error2), color = "blue") +
+  geom_point(aes(y = total_cost_error2), color = "blue") +
+  geom_line(aes(y = total_cost_error3), color = "black") +
+  geom_point(aes(y = total_cost_error3), color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  labs(title = "Forecast Error in Terms of Total Bid Cost (TBD)\nBenchmark Model (red) vs Competing Model (blue) vs LASSO (black)", y = "TBCE (W RMB)")
+
+g.mid <- ggplot(data = comparison, aes(x = bid_cycles)) +
+  theme_bw() +
+  geom_line(aes(y = unit_cost_error), color = "red", linetype = "dashed") +
+  geom_point(aes(y = unit_cost_error), color = "red") +
+  geom_line(aes(y = unit_cost_error2), color = "blue") +
+  geom_point(aes(y = unit_cost_error2), color = "blue") +
+  geom_line(aes(y = unit_cost_error3), color = "black") +
+  geom_point(aes(y = unit_cost_error3), color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  labs(title = "Forecast Error in Terms of Total Bid Cost (TBD)\nBenchmark Model (red) vs Competing Model (blue) vs LASSO (black)", y = "PTC-AE (RMB)")
+
+g.bottom <- ggplot(data = comparison, aes(x = bid_cycles)) +
+  theme_bw() +
+  geom_line(aes(y = abs(total_cost_error_perc)), color = "red", linetype = "dashed") +
+  geom_point(aes(y = abs(total_cost_error_perc)), color = "red") +
+  geom_line(aes(y = abs(total_cost_error_perc2)), color = "blue") +
+  geom_point(aes(y = abs(total_cost_error_perc2)), color = "blue") +
+  geom_line(aes(y = abs(total_cost_error_perc3)), color = "black") +
+  geom_point(aes(y = abs(total_cost_error_perc3)), color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  labs(y = "TBCPE")
+
+epsilon = 0.05
+grid.arrange(g.top, g.mid, g.bottom, heights = c(0.5, 0.5, 0.5))
+#              
+comparison3 <- data.frame(Benchmark = res_1, IdxModel = res_2, IdxModel_LASSO = res_3)
+rownames(comparison3) <- c('Avg R Square', 'Avg Mae', 'Avg MAPE', 'Mean ATBCE', 'Mean ATBCPE', 'Mean PTCAE')
+```
+
+
+```{r}
+comparison3
+```
+
+王乐：在经过对指数一定的手工筛选之后，现在看不出LASSO能对拟合结果产生什么影响（上图中红线黑线几乎重合）。预测模型的预测能力虽然在单次船价的单价（￥/每吨）可能有7元人民币左右的误差，但是对每一次竞标的总价预测误差在6%上下， 2017年后的总价预测误差基本在2% 一下
+下一步考虑可以加入些过去（最近）的运价数据（比如同一个航线同一种船型），或者增加几个类似的变量然后尝试Decision Tree 
+
+```{r}
+# 2017年开始的平均 TBC-APE， 模型为 Idx Model 
+mean(abs(total_cost_perc_list_3[6:12]))
+```
+
+
+
+
+
+
+加入变量“最近一次同类型船价”
+
+```{r}
+test_df <- regress.df %>% select(bid_time, cost, port, vsl_type, ship_time)
+test_df$last_cost <- NA
+
+for (i in 1: nrow(test_df)){
+  temp = filter(test_df, bid_time < test_df[i, "bid_time"], port == test_df[i, "port"], 
+                vsl_type == test_df[i, "vsl_type"])
+  if (nrow(temp) > 0) {
+    test_df[i, "last_cost"] <- tail(temp$cost, 1)
+  }
+}
+
+```
+
+
+```{r}
+i = 26
+test_df[i, "bid_time"]
+test_df[i, "port"]
+test_df[i, "vsl_type"]
+temp = filter(test_df, bid_time < test_df[i, "bid_time"], port == test_df[i, "port"], 
+                vsl_type == test_df[i, "vsl_type"])
+tail(temp$cost, 1)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
