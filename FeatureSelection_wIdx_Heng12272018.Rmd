@@ -614,11 +614,52 @@ temp = filter(test_df, bid_time < test_df[i, "bid_time"], port == test_df[i, "po
 tail(temp$cost, 1)
 
 ```
+以下我们仔细比对次竞标的成本以及预测。
 
 
+```{r}
+load("clean_data_nov172018.RData")
+comparison_w_bid <- comparison %>% select(bid_cycles, unit_cost_error, unit_cost_error2)
+temp3 <- regress.df %>% select(bid_time, port, ship_time, total_weight)
+df.clean$bid_time <- as.Date(df.clean$bid_time)
+df.clean_restrict <- merge(df.clean, temp3, by = c("bid_time", "port", "ship_time", "total_weight"))
+  
+temp <- df.clean_restrict %>% mutate(total_income = total_weight * income, total_cost = total_weight*cost) %>% 
+        group_by(bid_time) %>% summarise(per_bid_weight = sum(total_weight), per_bid_income = sum(total_income),
+        per_bid_cost = sum(total_cost)) %>%
+        mutate(effective_income = per_bid_income/per_bid_weight,effect_cost = per_bid_cost/per_bid_weight)
+temp2 <- df.clean_restrict %>% select(bid_time, income) %>% group_by(bid_time) %>%
+         summarise(bid = min(income))
+temp <- merge(temp2,temp, by = "bid_time") %>% select(-per_bid_weight, -per_bid_income, -per_bid_cost)
+colnames(temp)[1] = "bid_cycles"
+comparison_w_bid <- merge(comparison_w_bid, temp, by = "bid_cycles", all.x = T)
+comparison_w_bid <- comparison_w_bid %>% mutate(M1_pred_cost = effect_cost + unit_cost_error,
+                    M2_pred_cost = effect_cost + unit_cost_error2) %>% select(-unit_cost_error, -unit_cost_error2)
 
+comparison_w_bid_long <- melt(comparison_w_bid, id.vars = "bid_cycles")
+colnames(comparison_w_bid_long) <- c("bid_cycles", "Types","Value")
+ggplot(comparison_w_bid_long, aes(x = bid_cycles, y = Value, fill = Types)) +
+  geom_bar(position = "dodge", color = "black", stat = "identity", size = 0.1) + 
+  scale_fill_brewer(palette = "Pastel1") + theme(legend.position="top") + 
+  labs(title = "Bid, Income, Cost, and Forecast Cost Bar Plot", y = "Per Ton Value (in RMB)", x = "Bid Cycles")
+```
+注释：
 
+  - bid: （标地港）竞标价格
+  - effective_income: 加权平均调整后每吨实际收入（由于一些港口收入为标地港+5元）
+  - effective_cost: 平均每吨成本
+  - M1_pred_cost: 基准模型预测每吨成本
+  - M2_pred_cost：指数模型预测每吨成本
+  
+以下为一种不同的呈现形式。总体上说比起竞标价格，我们的预测更为贴近实际成本。
 
+```{r}
+ggplot(comparison_w_bid_long, aes(x = bid_cycles, y = Value, group = Types)) +
+  geom_point(aes(color = Types), size = 2) + 
+  geom_line(aes(color = Types, linetype = Types)) + 
+  scale_fill_brewer(palette = "Pastel1") + theme(legend.position="top")+
+  labs(title = "Bid, Income, Cost, and Forecast Cost Line Plot", y = "Per Ton Value (in RMB)", x = "Bid Cycles")
+```
 
 
 
